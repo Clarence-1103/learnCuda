@@ -77,6 +77,41 @@ __global__ void retrieval_kernel_2(const float *__restrict__ Q, const float *__r
     }
 }
 
+__global__ void retrieval_kernel_3(const float *__restrict__ Q, const float *__restrict__ K, float *__restrict__ score, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int B, int S){
+    // Q: [batch, dim], the query tensors
+    // K: [N, dim], the key tensors
+    // score: [S], the result score values
+    // block_table: [S], the index for K. It's a flattened tensors which actually compose `batch` segment: [N1, N2, N3] for batch = 3, N1 + N2 + N3 = S
+    // batch_index: [S], the mark specifying which batch current index belongs to and which Q current K[index] should be compared with.
+    // dim: feature size
+    extern __shared__ float local_score[]; // num of threads
+    int global_x = blockIdx.x;
+    int local_x = threadIdx.x;
+    if (global_x < S){
+        const float *q = Q + batch_index[global_x] * dim;
+        const float *k = K + block_table[global_x] * dim;
+        int num_tiles = (dim + 4 * blockDim.x - 1) / (4 * blockDim.x);
+        float sum = 0.0f;
+        for(int i = 0; i < num_tiles; ++i){
+            int tile_offset = i * (4 * blockDim.x);
+            if(tile_offset + local_x * 4 + 4 <= dim){
+                const float4 *q4 = reinterpret_cast<const float4*>(q + tile_offset + local_x * 4);
+                const float4 *k4 = reinterpret_cast<const float4*>(k + tile_offset + local_x * 4);
+                sum += q4->x * k4->x + q4->y * k4->y + q4->z * k4->z + q4->w * k4->w;
+            }
+        }
+        local_score[local_x] = sum;
+        __syncthreads();
+        for(int i = blockDim.x / 2; i; i = i / 2){
+            if(local_x < i){
+                local_score[local_x] = local_score[local_x] + local_score[local_x + i];
+            }
+            __syncthreads();
+        }
+        score[global_x] = local_score[0];
+    }
+}
+
 
 void retrieval_host(float *Q, float *K, float *score, int *block_table, int *batch_index, int dim, int B, int S){
     for(int i = 0; i < S; ++i){
@@ -102,10 +137,13 @@ void init_mat(float *mat, int sz){
 
 int main(){
     float *h_Q, *h_K;
-    int B = 32;
-    int dim = 8 * 128;
-    int N = 3000;
+    int B ;
+    int seq_len;
+    int dim;
+    scanf("%d%d%d", &B, &seq_len, &dim);
 
+
+    int N = 4000;
     h_Q = (float*)malloc(B * dim * sizeof(float));
     h_K = (float*)malloc(N * dim * sizeof(float));
 
@@ -117,7 +155,7 @@ int main(){
     h_kv_len = (int*)malloc(B * sizeof(int));
     int *kv_start_offsets ;
     kv_start_offsets = (int*)malloc((B+1) * sizeof(int));
-    int kv_len_each = (10000 / 128);
+    int kv_len_each = (seq_len / 128);
     for(int i = 0; i < B; ++i){
         h_kv_len[i] = kv_len_each;
         kv_start_offsets[i] = total_kv_len;
@@ -160,13 +198,15 @@ int main(){
     cuda_check(cudaMemcpy(d_batch_index, batch_index, sizeof(int) * total_kv_len, cudaMemcpyHostToDevice));
 
 
-    dim3 numThreads = {(unsigned int)(dim / tile)};
+    dim3 numThreads = {(unsigned int)(32)};
     dim3 numBlocks = {(unsigned int)total_kv_len};
 
     for (int i = 0; i < 10; ++i){
         retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
-        size_t bytes = 2 * dim * sizeof(float) + numThreads.x * sizeof(float);
-        retrieval_kernel_2<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+        // size_t bytes = 2 * dim * sizeof(float) + numThreads.x * sizeof(float);
+        // retrieval_kernel_2<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+        size_t bytes = numThreads.x * sizeof(float);
+        retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
     }
 
     cudaEvent_t start, stop, start_2, stop_2;
@@ -187,14 +227,16 @@ int main(){
 
 
     cudaEventRecord(start_2, 0);
-    size_t bytes = 2 * dim * sizeof(float) + numThreads.x * sizeof(float);
-    retrieval_kernel_2<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+    // size_t bytes = 2 * dim * sizeof(float) + numThreads.x * sizeof(float);
+    // retrieval_kernel_2<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+    size_t bytes = numThreads.x * sizeof(float);
+    retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
     cudaEventRecord(stop_2, 0);
     cuda_check(cudaPeekAtLastError());
     cuda_check(cudaEventSynchronize(stop_2));
     float milliseconds_2 = 0;
     cudaEventElapsedTime(&milliseconds_2, start_2, stop_2);
-    printf("Time spent on retrieval_kernel_2: %f ms\n", milliseconds_2);
+    printf("Time spent on retrieval_kernel_3: %f ms\n", milliseconds_2);
 
 
     float *h_score_gpu;
