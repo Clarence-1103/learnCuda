@@ -11,19 +11,18 @@
 } \
 
 
-__global__ void extract_repre(const float *key_cache, float *repre_cache, const int *block_table, int block_size, int dim, int block_number) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < block_number) {
-        int block_id = block_table[idx];
-        const float* key_ptr = key_cache + block_id * block_size * dim;
-        float* repre_ptr = repre_cache + block_id * dim;
-        for (int d = 0; d < dim; ++d) {
-            float sum = 0.0f;
-            for (int j = 0; j < block_size; ++j) {
-                sum += key_ptr[j * dim + d];
-            }
-            repre_ptr[d] = sum / block_size;
+__global__ void extract_repre(const float *key_cache, float *repre_cache, const int *block_table, int block_size, int dim) {
+    int idx = blockIdx.x;
+    int block_id = block_table[idx];
+    const float* key_ptr = key_cache + block_id * block_size * dim;
+    float* repre_ptr = repre_cache + block_id * dim;
+    int d = threadIdx.x;
+    if (d < dim) {
+        float sum = 0.0f;
+        for (int j = 0; j < block_size; ++j) {
+            sum += key_ptr[j * dim + d];
         }
+        repre_ptr[d] = sum / block_size;
     }
 }
 
@@ -80,10 +79,10 @@ int main(){
     cuda_check(cudaMemcpy(d_block_table, h_block_table, block_number * sizeof(int), cudaMemcpyHostToDevice));
 
     // warm‐up
-    int threads = 256;
-    int blocks = (block_number + threads - 1) / threads;
+    int threads = dim;
+    int blocks = block_number;
     for(int i = 0; i < 10; ++i){
-        extract_repre<<<blocks, threads>>>(d_key_cache, d_repre, d_block_table, block_size, dim, block_number);
+        extract_repre<<<blocks, threads>>>(d_key_cache, d_repre, d_block_table, block_size, dim);
     }
 
     // timing
@@ -91,7 +90,7 @@ int main(){
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start, 0);
-    extract_repre<<<blocks, threads>>>(d_key_cache, d_repre, d_block_table, block_size, dim, block_number);
+    extract_repre<<<blocks, threads>>>(d_key_cache, d_repre, d_block_table, block_size, dim);
     cudaEventRecord(stop, 0);
     cuda_check(cudaPeekAtLastError());
     cuda_check(cudaEventSynchronize(stop));
