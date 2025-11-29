@@ -3,11 +3,8 @@
 #include <chrono>
 #include <random>
 
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-
-using Ptr = uintptr_t;
-using PtrArray = py::array_t<uintptr_t>;
+#include <torch/extension.h>
+#include <torch/types.h>
 
 #define cuda_check(call){ \
     cudaError_t err = call; \
@@ -17,7 +14,7 @@ using PtrArray = py::array_t<uintptr_t>;
 } \
 
 // TODO: change Q from float* to float**
-__global__ void retrieval_kernel(const float *__restrict__ Q, const float *__restrict__ K, float *__restrict__ score, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int B, int S){
+__global__ void retrieval_kernel(const float *__restrict__ Q, const float *__restrict__ K, float *__restrict__ score, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int S){
     // Q: [batch, dim], the query tensors
     // K: [N, dim], the key tensors
     // score: [S], the result score values
@@ -40,7 +37,7 @@ __global__ void retrieval_kernel(const float *__restrict__ Q, const float *__res
 }
 
 #define tile 8
-__global__ void retrieval_kernel_2(const float *__restrict__ Q, const float *__restrict__ K, float *__restrict__ score, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int B, int S){
+__global__ void retrieval_kernel_2(const float *__restrict__ Q, const float *__restrict__ K, float *__restrict__ score, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int S){
     // Q: [batch, dim], the query tensors
     // K: [N, dim], the key tensors
     // score: [S], the result score values
@@ -83,7 +80,7 @@ __global__ void retrieval_kernel_2(const float *__restrict__ Q, const float *__r
     }
 }
 
-__global__ void retrieval_kernel_3(const float *__restrict__ Q, const float *__restrict__ K, float *__restrict__ score, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int B, int S){
+__global__ void retrieval_kernel_3(const float *__restrict__ Q, const float *__restrict__ K, float *__restrict__ score, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int S){
     // Q: [batch, dim], the query tensors
     // K: [N, dim], the key tensors
     // score: [S], the result score values
@@ -119,7 +116,7 @@ __global__ void retrieval_kernel_3(const float *__restrict__ Q, const float *__r
 }
 
 
-void retrieval_host(float *Q, float *K, float *score, int *block_table, int *batch_index, int dim, int B, int S){
+void retrieval_host(float *Q, float *K, float *score, int *block_table, int *batch_index, int dim, int S){
     for(int i = 0; i < S; ++i){
         int batch_id = batch_index[i];
         int k_index = block_table[i];
@@ -141,14 +138,36 @@ void init_mat(float *mat, int sz){
 
 }
 
-cudaError_t cuda_retrieval(py::object query, py::object repre_cache, py::object q_table, py::object repre_block_table){
+#define STRINGFY(func) #func
+#define TORCH_BINDING_COMMON_EXTENSION(func) \
+    m.def(STRINGFY(func), &func, STRINGFY(func));
+#define CHECK_TORCH_TENSOR_DTYPE(T, expect_type) \
+if (((T).options().dtype() != (expect_type))) { \
+    std::cout << "Got input tensor: " << (T).options() << std::endl; \
+    std::cout <<"But the kernel should accept tensor with " << (expect_type) << " dtype" << std::endl; \
+    throw std::runtime_error("mismatched tensor dtype"); \
+}
+
+void cuda_retrieval(torch::Tensor query, torch::Tensor repre_cache, torch::Tensor q_index, torch::Tensor repre_index, torch::Tensor score){
     // query: a list of ptr
     // repre_cache: a ptr
+    CHECK_TORCH_TENSOR_DTYPE(query, torch::kFloat32);
+    CHECK_TORCH_TENSOR_DTYPE(repre_cache, torch::kFloat32);
+    int s = q_index.size(0);
+    int dim = query.size(1);
+    dim3 numThreads = {(unsigned int)(32)};
+    dim3 numBlocks = {(unsigned int) s};
+    size_t bytes = numThreads.x * sizeof(float);
+    retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(query.data_ptr<float>(), repre_cache.data_ptr<float>(), score.data_ptr<float>(), repre_index.data_ptr<int>(), q_index.data_ptr<int>(), dim, s);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    TORCH_BINDING_COMMON_EXTENSION(cuda_retrieval)
 }
 
 // int main(){
 //     float *h_Q, *h_K;
-//     int B ;
+//     int B;
 //     int seq_len;
 //     int dim;
 //     scanf("%d%d%d", &B, &seq_len, &dim);
@@ -213,11 +232,11 @@ cudaError_t cuda_retrieval(py::object query, py::object repre_cache, py::object 
 //     dim3 numBlocks = {(unsigned int)total_kv_len};
 //
 //     for (int i = 0; i < 10; ++i){
-//         retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+//         retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, total_kv_len);
 //         // size_t bytes = 2 * dim * sizeof(float) + numThreads.x * sizeof(float);
-//         // retrieval_kernel_2<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+//         // retrieval_kernel_2<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, total_kv_len);
 //         size_t bytes = numThreads.x * sizeof(float);
-//         retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+//         retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, total_kv_len);
 //     }
 //
 //     cudaEvent_t start, stop, start_2, stop_2;
@@ -228,7 +247,7 @@ cudaError_t cuda_retrieval(py::object query, py::object repre_cache, py::object 
 //
 //
 //     cudaEventRecord(start, 0);
-//     retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+//     retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, total_kv_len);
 //     cudaEventRecord(stop, 0);
 //     cuda_check(cudaPeekAtLastError());
 //     cuda_check(cudaEventSynchronize(stop));
@@ -239,9 +258,9 @@ cudaError_t cuda_retrieval(py::object query, py::object repre_cache, py::object 
 //
 //     cudaEventRecord(start_2, 0);
 //     // size_t bytes = 2 * dim * sizeof(float) + numThreads.x * sizeof(float);
-//     // retrieval_kernel_2<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+//     // retrieval_kernel_2<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, total_kv_len);
 //     size_t bytes = numThreads.x * sizeof(float);
-//     retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, total_kv_len);
+//     retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, total_kv_len);
 //     cudaEventRecord(stop_2, 0);
 //     cuda_check(cudaPeekAtLastError());
 //     cuda_check(cudaEventSynchronize(stop_2));
@@ -255,14 +274,14 @@ cudaError_t cuda_retrieval(py::object query, py::object repre_cache, py::object 
 //     cuda_check(cudaMemcpy(h_score_gpu, d_score, total_kv_len * sizeof(float), cudaMemcpyDeviceToHost));
 //
 //     for (int i = 0; i < 10; ++i){
-//         retrieval_host(h_Q, h_K, h_score, block_table, batch_index, dim, B, total_kv_len);
+//         retrieval_host(h_Q, h_K, h_score, block_table, batch_index, dim, total_kv_len);
 //     }
 //
 //     auto h_start = std::chrono::high_resolution_clock::now();
-//     retrieval_host(h_Q, h_K, h_score, block_table, batch_index, dim, B, total_kv_len);
+//     retrieval_host(h_Q, h_K, h_score, block_table, batch_index, dim, total_kv_len);
 //     auto h_stop = std::chrono::high_resolution_clock::now();
 //     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(h_stop - h_start);
-//     printf("Time spent on retrieval_host: %ld ms\n", duration.count() / 1000000);
+//     printf("Time spent on retrieval_host: %f ms\n", (float)duration.count() / 1000000.0f);
 //
 //     float eps = 1e-3;
 //     float avg_error = 0.0f;
