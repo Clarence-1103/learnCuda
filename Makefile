@@ -10,5 +10,10 @@ copy_compute_test:
 	nvcc -o ./copy_compute_test ./copy_compute_test.cu
 retrieval_kernel:
 	nvcc -o ./retrieval_kernel ./retrieval_kernel.cu
-top_kernel:
-	nvcc -o ./top_kernel ./top_kernel.cu
+topk_kernel:
+	nvcc -o ./topk_kernel ./topk_kernel.cu
+matrix_multiply:
+	nvcc -o matrix_multiply matrix_multiply.cu
+hash_retrieval_kernel:
+	nvcc -o ./hash_retrieval_kernel ./hash_retrieval_kernel.cu
+
