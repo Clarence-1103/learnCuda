@@ -300,15 +300,75 @@ __global__ void hash_retrieval_kernel_3(const uint8_t *__restrict__ Q, const uin
     }
 }
 
-__global__ void hash_retrieval_kernel_4(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, int *scores, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int B, int block_size, int S) {
+// __global__ void hash_retrieval_kernel_4(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, int *scores, const int *__restrict__ block_table, const int *__restrict__ batch_index, int dim, int B, int block_size, int S) {
+//     // Q: [batch, dim], the query tensors
+//     // K: [N, block_size, dim], the key tensors
+//     // score: [S], the result score values
+//     // block_table: [S], the index for K. It's a flattened tensors which actually compose `batch` segment: [N1, N2, N3] for batch = 3, N1 + N2 + N3 = S
+//     // batch_index: [S], the mark specifying which batch current index belongs to and which Q current K[index] should be compared with.
+//     // dim: feature size
+//     // gridDim.x                 一共多少个块
+//     // blockDim.x                每个块多少线程处理dim维度
+//     int global_x = blockIdx.x;
+//     int local_x = threadIdx.x;
+//     int block_idx = global_x / block_size;
+//     int t_idx = global_x % block_size;
+
+//     if (global_x < S * block_size) {
+//         int batch_id = batch_index[block_idx];
+//         int k_index = block_table[block_idx];
+
+//         const uint8_t *pQ = Q + batch_id * dim;  // Q: 查询张量
+//         const uint8_t *pK = K + (k_index * block_size + t_idx) * dim;  // K: 键张量
+        
+//         int num_tiles = (dim + 16 * blockDim.x - 1) / (16 * blockDim.x); // 每个tile处理128个uint_8
+//         int sum = 0;
+//         for (int i = 0; i < num_tiles; ++i) {
+//             int tile_offset = i * (16 * blockDim.x);   // 一次偏移128个uint8，
+//             if (tile_offset + local_x * 16 + 16 <= dim) {
+//                 // 加载 16 个 uint8_t 数据（128 位），每次加载 4 个 uint32_t
+//                 const uint4* q4 = reinterpret_cast<const uint4*>(pQ + tile_offset + local_x * 16);
+//                 const uint4* k4 = reinterpret_cast<const uint4*>(pK + tile_offset + local_x * 16);
+//                 uint4 q4_val = *q4;
+//                 uint4 k4_val = *k4;
+//                 uint4 xor_val = make_uint4(q4_val.x ^ k4_val.x, q4_val.y ^ k4_val.y, q4_val.z ^ k4_val.z, q4_val.w ^ k4_val.w);
+//                 sum += __popc(xor_val.x) + __popc(xor_val.y) + __popc(xor_val.z) + __popc(xor_val.w);
+//             }
+//         }
+
+//         // Warp-level reduction using shuffle
+//         int local_sum = sum;
+//         #pragma unroll
+//         for (int offset = 16; offset > 0; offset /= 2) {
+//             local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+//         }
+
+//         // The first thread of the warp writes the result
+//         if (local_x % 32 == 0) {
+//             atomicMin(&scores[block_idx], local_sum);  // Only the first thread performs the atomicMin
+//         }
+//     }
+// }
+
+__global__ void hash_retrieval_kernel_4(
+    const uint8_t *__restrict__ Q,
+    const uint8_t *__restrict__ K,
+    int *__restrict__ scores,
+    const int *__restrict__ block_table,
+    const int *__restrict__ batch_index,
+    int dim,
+    int B,
+    int block_size,
+    int S
+) {
     // Q: [batch, dim], the query tensors
     // K: [N, block_size, dim], the key tensors
     // score: [S], the result score values
     // block_table: [S], the index for K. It's a flattened tensors which actually compose `batch` segment: [N1, N2, N3] for batch = 3, N1 + N2 + N3 = S
     // batch_index: [S], the mark specifying which batch current index belongs to and which Q current K[index] should be compared with.
     // dim: feature size
-    // gridDim.x = S * block_size 一共多少个块
-    // blockDim.x = 32           每个块多少线程处理dim维度
+    // gridDim.x                 一共多少个块
+    // blockDim.x                每个块多少线程处理dim维度
 
     int global_x = blockIdx.x;
     int local_x = threadIdx.x;
@@ -322,7 +382,6 @@ __global__ void hash_retrieval_kernel_4(const uint8_t *__restrict__ Q, const uin
         const uint8_t *pQ = Q + batch_id * dim;  // Q: 查询张量
         const uint8_t *pK = K + (k_index * block_size + t_idx) * dim;  // K: 键张量
         
-        // blockDim.x = 8；uint4就是 16 * blockDim.x = 128
         int num_tiles = (dim + 16 * blockDim.x - 1) / (16 * blockDim.x); // 每个tile处理128个uint_8
         int sum = 0;
         for (int i = 0; i < num_tiles; ++i) {
@@ -345,9 +404,29 @@ __global__ void hash_retrieval_kernel_4(const uint8_t *__restrict__ Q, const uin
             local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
         }
 
-        // The first thread of the warp writes the result
+        // 使用共享内存存储每个 warp 的计算结果
+        extern __shared__ int warp_sums[]; // 动态分配共享内存
+
+        int warp_id = local_x / 32;  // 每个 warp 有 32 个线程
+
+        // 每个 warp 线程执行完后，将 sum 存入共享内存
         if (local_x % 32 == 0) {
-            atomicMin(&scores[block_idx], local_sum);  // Only the first thread performs the atomicMin
+            warp_sums[warp_id] = local_sum;
+        }
+        __syncthreads();  // 等待所有 warp 完成
+
+        // Warp 之间的归约：块内的线程将 warp 的结果进行归约
+        if (warp_id == 0) {
+            int warp_total = 0;
+            // 对当前块的所有 warp 的 sum 进行汇总
+            for (int i = 0; i < 32; i++) {
+                warp_total += warp_sums[i];
+            }
+
+            // 将每个块的结果存储到全局结果数组中
+            if (local_x == 0) {
+                atomicMin(&scores[block_idx], warp_total);
+            }
         }
     }
 }
@@ -481,10 +560,8 @@ int main(){
     cuda_check(cudaMalloc(&d_batch_index, sizeof(int) * total_kv_len));
     cuda_check(cudaMemcpy(d_batch_index, batch_index, sizeof(int) * total_kv_len, cudaMemcpyHostToDevice));
 
-    // 沿x轴的线程块数量和每个线程块中的线程数量（x=8， y = 1， z = 1）
-    dim3 numThreads = {(unsigned int)(32)};                            // 128 threads per block = block_size
+    dim3 numThreads = {(unsigned int)(128)};                            // 128 threads per block = block_size
     dim3 numBlocks = {(unsigned int)(total_kv_len)};                    // total_kv_len =  所有batch用的number blocks之和
-    dim3 numBlocks_3 = {(unsigned int)(total_kv_len * block_size)};      // total_kv_len =  所有batch用的number blocks之和
     
     // warm-up
     for (int i = 0; i < 10; ++i){
@@ -492,8 +569,9 @@ int main(){
         hash_retrieval_kernel_1<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
         hash_retrieval_kernel_2<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
         size_t bytes =  numThreads.x * sizeof(int);
-        hash_retrieval_kernel_3<<<numBlocks_3, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
-        hash_retrieval_kernel_4<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+        hash_retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+        size_t shared_mem = (numThreads.x / 32) * sizeof(int); // warp的数量
+        hash_retrieval_kernel_4<<<numBlocks, numThreads, shared_mem>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
     }
 
     cudaEvent_t start, stop, start_1, stop_1, start_2, stop_2, start_3, stop_3, start_4, stop_4;
@@ -541,7 +619,7 @@ int main(){
     // v3
     cudaEventRecord(start_3, 0);
     size_t bytes =  numThreads.x * sizeof(int);
-    hash_retrieval_kernel_3<<<numBlocks_3, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+    hash_retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
     cudaEventRecord(stop_3, 0);
     cuda_check(cudaPeekAtLastError());
     cuda_check(cudaEventSynchronize(stop_3));
@@ -551,7 +629,8 @@ int main(){
 
     // v4
     cudaEventRecord(start_4, 0);
-    hash_retrieval_kernel_4<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+    size_t shared_mem = (numThreads.x / 32) * sizeof(int); // warp的数量
+    hash_retrieval_kernel_4<<<numBlocks, numThreads, shared_mem>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
     cudaEventRecord(stop_4, 0);
     cuda_check(cudaPeekAtLastError());
     cuda_check(cudaEventSynchronize(stop_4));
