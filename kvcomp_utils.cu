@@ -129,16 +129,6 @@ void kvcomp_retrieval(const std::vector<torch::Tensor> &query_list, torch::Tenso
     // uint8_t **Q_ptrs;
     // cuda_check(cudaMalloc(&Q_ptrs, batch * sizeof(uint8_t*)));
     // cuda_check(cudaMemcpy(Q_ptrs, h_Q_ptrs.data(), batch * sizeof(uint8_t*), cudaMemcpyHostToDevice));
-    
-    // // 获取数据指针
-    // auto* data_ptr = score.data_ptr<int>();  // 假设 tensor 的数据类型为 float
-    // int size = score.numel();  // 获取张量的总元素个数
-    
-    // std::cout << "*****" << std::endl;
-    // // 打印每个元素
-    // for (int i = 0; i < size; ++i) {
-    //     std::cout << data_ptr[i] << " ";
-    // }
 
     hash_retrieval_kernel<<<numBlocks, numThreads, shared_mem>>>(Q_ptrs, repre_cache.data_ptr<uint8_t>(), score.data_ptr<int>(), repre_index.data_ptr<int>(), q_index.data_ptr<int>(), dim, block_size, s);
     
