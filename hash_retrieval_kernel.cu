@@ -397,35 +397,34 @@ __global__ void hash_retrieval_kernel_4(
             }
         }
 
-        // Warp-level reduction using shuffle
+        // Warp-level reduction using __shfl_down_sync
         int local_sum = sum;
-        #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
         }
 
-        // 使用共享内存存储每个 warp 的计算结果
-        extern __shared__ int warp_sums[]; // 动态分配共享内存
+        // Shared memory for warp-level results, assuming blockDim.x is a multiple of 32
+        extern __shared__ int shared_sum[];  // Dynamic shared memory, size determined by blockDim.x
+        int num_warps = blockDim.x / 32;
 
-        int warp_id = local_x / 32;  // 每个 warp 有 32 个线程
-
-        // 每个 warp 线程执行完后，将 sum 存入共享内存
-        if (local_x % 32 == 0) {
-            warp_sums[warp_id] = local_sum;
+        // Store the result of the warp reduction in shared memory
+        if (local_x % 32 == 0 && local_x / 32 < num_warps) {
+            shared_sum[local_x / 32] = local_sum;
         }
-        __syncthreads();  // 等待所有 warp 完成
+        __syncthreads();
 
-        // Warp 之间的归约：块内的线程将 warp 的结果进行归约
-        if (warp_id == 0) {
-            int warp_total = 0;
-            // 对当前块的所有 warp 的 sum 进行汇总
-            for (int i = 0; i < 32; i++) {
-                warp_total += warp_sums[i];
+        // Block-level reduction using the results stored in shared memory
+        if (local_x < num_warps) {  // Only one thread from each warp will do the next step
+            int warp_sum = shared_sum[local_x];
+
+            // Adjust offset dynamically based on blockDim.x
+            for (int offset = (blockDim.x / 64); offset > 0; offset /= 2) {
+                warp_sum += __shfl_down_sync(0xFFFFFFFF, warp_sum, offset);
             }
 
-            // 将每个块的结果存储到全局结果数组中
+            // Only the first thread in the block performs the atomicMin
             if (local_x == 0) {
-                atomicMin(&scores[block_idx], warp_total);
+                atomicMin(&scores[block_idx], warp_sum);
             }
         }
     }
@@ -560,16 +559,16 @@ int main(){
     cuda_check(cudaMalloc(&d_batch_index, sizeof(int) * total_kv_len));
     cuda_check(cudaMemcpy(d_batch_index, batch_index, sizeof(int) * total_kv_len, cudaMemcpyHostToDevice));
 
-    dim3 numThreads = {(unsigned int)(128)};                            // 128 threads per block = block_size
-    dim3 numBlocks = {(unsigned int)(total_kv_len)};                    // total_kv_len =  所有batch用的number blocks之和
+    dim3 numThreads = {(unsigned int)(32)};                                          // 128 threads per block = block_size
+    dim3 numBlocks = {(unsigned int)(total_kv_len * block_size)};                    // total_kv_len =  所有batch用的number blocks之和
     
     // warm-up
     for (int i = 0; i < 10; ++i){
-        hash_retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
-        hash_retrieval_kernel_1<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
-        hash_retrieval_kernel_2<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
-        size_t bytes =  numThreads.x * sizeof(int);
-        hash_retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+        // hash_retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+        // hash_retrieval_kernel_1<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+        // hash_retrieval_kernel_2<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+        // size_t bytes =  numThreads.x * sizeof(int);
+        // hash_retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
         size_t shared_mem = (numThreads.x / 32) * sizeof(int); // warp的数量
         hash_retrieval_kernel_4<<<numBlocks, numThreads, shared_mem>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
     }
@@ -586,46 +585,46 @@ int main(){
     cudaEventCreate(&start_4);
     cudaEventCreate(&stop_4);
     
-    // v0
-    cudaEventRecord(start, 0);
-    hash_retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
-    cudaEventRecord(stop, 0);
-    cuda_check(cudaPeekAtLastError());
-    cuda_check(cudaEventSynchronize(stop));
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Time spent on hash_retrieval_kernel: %f ms\n", milliseconds);
+    // // v0
+    // cudaEventRecord(start, 0);
+    // hash_retrieval_kernel<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+    // cudaEventRecord(stop, 0);
+    // cuda_check(cudaPeekAtLastError());
+    // cuda_check(cudaEventSynchronize(stop));
+    // float milliseconds = 0;
+    // cudaEventElapsedTime(&milliseconds, start, stop);
+    // printf("Time spent on hash_retrieval_kernel: %f ms\n", milliseconds);
     
-    // v1
-    cudaEventRecord(start_1, 0);
-    hash_retrieval_kernel_1<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
-    cudaEventRecord(stop_1, 0);
-    cuda_check(cudaPeekAtLastError());
-    cuda_check(cudaEventSynchronize(stop_1));
-    float milliseconds_1 = 0;
-    cudaEventElapsedTime(&milliseconds_1, start_1, stop_1);
-    printf("Time spent on hash_retrieval_kernel_1: %f ms\n", milliseconds_1);
+    // // v1
+    // cudaEventRecord(start_1, 0);
+    // hash_retrieval_kernel_1<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+    // cudaEventRecord(stop_1, 0);
+    // cuda_check(cudaPeekAtLastError());
+    // cuda_check(cudaEventSynchronize(stop_1));
+    // float milliseconds_1 = 0;
+    // cudaEventElapsedTime(&milliseconds_1, start_1, stop_1);
+    // printf("Time spent on hash_retrieval_kernel_1: %f ms\n", milliseconds_1);
 
-    // v2
-    cudaEventRecord(start_2, 0);
-    hash_retrieval_kernel_2<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
-    cudaEventRecord(stop_2, 0);
-    cuda_check(cudaPeekAtLastError());
-    cuda_check(cudaEventSynchronize(stop_2));
-    float milliseconds_2 = 0;
-    cudaEventElapsedTime(&milliseconds_2, start_2, stop_2);
-    printf("Time spent on hash_retrieval_kernel_2: %f ms\n", milliseconds_2);
+    // // v2
+    // cudaEventRecord(start_2, 0);
+    // hash_retrieval_kernel_2<<<numBlocks, numThreads>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+    // cudaEventRecord(stop_2, 0);
+    // cuda_check(cudaPeekAtLastError());
+    // cuda_check(cudaEventSynchronize(stop_2));
+    // float milliseconds_2 = 0;
+    // cudaEventElapsedTime(&milliseconds_2, start_2, stop_2);
+    // printf("Time spent on hash_retrieval_kernel_2: %f ms\n", milliseconds_2);
 
-    // v3
-    cudaEventRecord(start_3, 0);
-    size_t bytes =  numThreads.x * sizeof(int);
-    hash_retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
-    cudaEventRecord(stop_3, 0);
-    cuda_check(cudaPeekAtLastError());
-    cuda_check(cudaEventSynchronize(stop_3));
-    float milliseconds_3 = 0;
-    cudaEventElapsedTime(&milliseconds_3, start_3, stop_3);
-    printf("Time spent on hash_retrieval_kernel_3: %f ms\n", milliseconds_3);
+    // // v3
+    // cudaEventRecord(start_3, 0);
+    // size_t bytes =  numThreads.x * sizeof(int);
+    // hash_retrieval_kernel_3<<<numBlocks, numThreads, bytes>>>(d_Q, d_K, d_score, d_block_table, d_batch_index, dim, B, block_size, total_kv_len);
+    // cudaEventRecord(stop_3, 0);
+    // cuda_check(cudaPeekAtLastError());
+    // cuda_check(cudaEventSynchronize(stop_3));
+    // float milliseconds_3 = 0;
+    // cudaEventElapsedTime(&milliseconds_3, start_3, stop_3);
+    // printf("Time spent on hash_retrieval_kernel_3: %f ms\n", milliseconds_3);
 
     // v4
     cudaEventRecord(start_4, 0);
@@ -662,6 +661,7 @@ int main(){
         if(diff > eps){
             printf("not ok @%d!!! %d vs %d, err %f\n", i, h_score[i], h_score_gpu[i], diff);
         }
+        printf("%d  !!!!h_score: %d !!!gpu_score: %d\n", i, h_score[i], h_score_gpu[i]);
     }
     avg_error = avg_error / total_kv_len;
     printf("avg error: %f\n", avg_error);

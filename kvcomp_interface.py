@@ -1,14 +1,15 @@
 import torch
 import math
 from torch.utils.cpp_extension import load
+from hash_encoder import HashEncoder
 import time
 
 torch.set_grad_enabled(False)
 
 # Load the CUDA kernel as a python module
 lib = load(
-    name="hash_retrieval_kernel",
-    sources=["hash_retrieval_kernel.cu"],
+    name="kvcomp_utils",
+    sources=["kvcomp_utils.cu"],
     extra_cuda_cflags=[
         "-O3",
         "-U__CUDA_NO_HALF_OPERATORS__",
@@ -33,38 +34,60 @@ query_list = []
 for i in range(b):
     query_list.append(torch.randint(0, 256, (dim,), dtype=torch.uint8).cuda())
 
+
 repre_cache = torch.randint(0, 256, (N, block_size, dim), dtype=torch.uint8).cuda()
 repre_table = torch.arange(0, s, dtype = torch.int32).cuda()
 q_table = torch.arange(0, s, dtype = torch.int32).cuda()
 q_table = q_table % b
 score = torch.full((s,), torch.iinfo(torch.int32).max, dtype=torch.int32).cuda()
+
+score_sorted = torch.full((s,), torch.iinfo(torch.int32).max, dtype=torch.int32).cuda()
+index = torch.arange(0, s, dtype=torch.int32).cuda()
+index_sorted = torch.arange(0, s, dtype=torch.int32).cuda()
+offsets = torch.arange(0, s, math.ceil(s / b), dtype=torch.int32).cuda()
+offsets = torch.cat([offsets, torch.tensor([s], dtype=torch.int32).cuda()])
+workspace = torch.zeros(10000, dtype=torch.int32).cuda()
+
 start = time.time()
-kvcomp_retrieval(query_list, repre_cache, q_table, repre_table, score)
+kvcomp_retrieval(query_list, repre_cache, q_table, repre_table, score,
+                score_sorted, index, index_sorted, offsets, workspace)
 print("launch spent: ", time.time() - start)
 torch.cuda.synchronize()
 elapsed_cuda = time.time() - start
 print(f"kvcomp_retrieval time: {elapsed_cuda:.6f} s")
-print("kvcomp_retrieval_score: ", score)
 
+popcount_table = torch.tensor([bin(i).count('1') for i in range(256)], dtype=torch.int32)
+
+def bit_count(x):
+    return popcount_table[x]
 
 def naive_hash_retrieval():
     # 1. 将 query_list 堆叠成一个 [N, dim] 的张量
     query = torch.stack(query_list)  # [N, dim]
 
     # 2. 根据 q_table 从 query 中选择相应的 query_encoder
-    query_encoder = query[q_table]  # 形状为 [S, dim]
+    query_encoder = query[q_table]  # [S, dim]
     
     # 3. 根据 repre_table 从 repre_cache 中选择相应的 repre_cache_encoder
-    repre_cache_encoder = repre_cache[repre_table]  # 形状为 [S, block_size, dim]
+    repre_cache_encoder = repre_cache[repre_table]  # [S, block_size, dim]
     
     # 4. 对 query_encoder 和 repre_cache_encoder 进行按位异或
-    scores = torch.bitwise_xor(query_encoder.unsqueeze(1), repre_cache_encoder)  # 形状为 [S, block_size, dim]
-    
-    # 5. 沿着 dim 维度进行求和，得到形状为 [S, block_size]
-    scores_flat = torch.sum(scores, dim=-1)  # 形状为 [S, block_size]
-    
-    # 6. 在 block_size 维度上选择最小值，得到形状为 [S]
-    hamming_scores_gt = torch.min(scores_flat, dim=-1).values  # 最小值，形状为 [S]
+    scores = torch.bitwise_xor(query_encoder.unsqueeze(1), repre_cache_encoder)  # [S, block_size, dim]
+
+    # 5. 对每个 uint8 元素应用查表法
+    ones_count = torch.zeros_like(scores, dtype=torch.int32)
+
+    # 5.1 使用查表法统计每个 uint8 数字中 1 的个数
+    for i in range(scores.shape[0]):
+        for j in range(scores.shape[1]):
+            for k in range(scores.shape[2]):
+                ones_count[i, j, k] = popcount_table[scores[i, j, k].item()]
+
+    # 5.2 沿着 dim 维度求和
+    scores_flat = torch.sum(ones_count, dim=-1) # [S, block_size]
+
+    # 6. 在 block_size 维度上选择最小值
+    hamming_scores_gt = torch.min(scores_flat, dim=-1).values  # [S]
     
     # 7. 返回输出
     return hamming_scores_gt
@@ -76,11 +99,15 @@ torch.cuda.synchronize()
 elapsed_naive = time.time() - start
 print(f"naive_hash_retrieval time: {elapsed_naive:.6f} s")
 print("score_gt: ", score_gt)
+print("score_kernel: ", score)
+print("score_sorted: ", score_sorted)
+print("index_sorted: ", index_sorted)
+
 diff = (score.float() - score_gt.float()).abs()
 print("diff: ", diff.mean(), diff.max())
 
-total_seq_len = 1000
-batch_size = 10
+total_seq_len = 10000
+batch_size = 4
 topk = 10
 num_layers = 61
 warmup_iters = 10
@@ -104,6 +131,7 @@ index_out = torch.zeros(total_seq_len, dtype=torch.int32).cuda()
 
 
 cost_time = []
+workspace = torch.zeros(10000, dtype=torch.int32).cuda()
 for iter in range(warmup_iters + num_layers):
     begin = time.time()
     # reset index tensor for radixSort
@@ -111,7 +139,7 @@ for iter in range(warmup_iters + num_layers):
     #     index[i] = i
     # for i in range(batch_size + 1):
     #     offsets[i] = i * math.ceil(total_seq_len / batch_size)
-    kvcomp_topk(score, index, offsets, score_out, index_out, topk)
+    kvcomp_topk(score, index, offsets, score_out, index_out, workspace)
 
     torch.cuda.synchronize()
     duration = time.time() - begin
@@ -120,19 +148,19 @@ for iter in range(warmup_iters + num_layers):
 
 print(f"kvcomp topk: each_layer: {sum(cost_time) / len(cost_time)}, all_layers: {sum(cost_time)}")
 
+
 cost_time_2 = []
 for iter in range(warmup_iters + num_layers):
     begin = time.time()
-    # gt_index = []
-    # for start, stop in zip(offsets[:-1], offsets[1:]):
-    #     sorted, indices = torch.sort(score[start:stop], dim=0, descending=False, stable=False, out=None)
-    #     indices += start
-    #     gt_index.append(indices)
-    # gt_index = torch.cat(gt_index)
-    score = score.view(batch_size, -1)
-    # _, gt_index = torch.sort(score, dim=1, descending=False, stable=False, out=None)
-    _, gt_index = torch.topk(score, dim=1, k=topk, largest=False)
-    gt_index += torch.arange(0, batch_size)[:, None].cuda() * math.ceil(total_seq_len / batch_size)
+    gt_index = []
+    for start, stop in zip(offsets[:-1], offsets[1:]):
+        sorted, indices = torch.topk(score[start:stop], dim=0, k=topk, largest=False)
+        indices += start
+        gt_index.append(indices)
+    gt_index = torch.stack(gt_index)
+    # score = score.view(batch_size, -1)
+    # _, gt_index = torch.topk(score, dim=1, k=topk)
+    # gt_index += torch.arange(0, batch_size)[:, None].cuda() * math.ceil(total_seq_len / batch_size)
     gt_index = gt_index.view(-1)
     torch.cuda.synchronize()
     duration = time.time() - begin
@@ -146,4 +174,3 @@ gt_index = gt_index.view(batch_size, -1)
 print(index_out.shape, gt_index.shape)
 diff = (index_out[:, :topk] - gt_index).abs()
 print("diff: ", diff.max())
-# assert torch.equal(index_out, gt_index)
