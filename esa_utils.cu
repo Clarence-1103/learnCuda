@@ -41,11 +41,11 @@ __global__ void extract_repre(const scalar_t *key_cache, scalar_t *repre_cache, 
     scalar_t* repre_ptr = repre_cache + block_id_2 * dim;
     int d = threadIdx.x;
     if (d < dim) {
-        scalar_t sum = 0;
+        float sum = 0;
         for (int j = 0; j < block_size; ++j) {
-            sum += key_ptr[j * dim + d];
+            sum += static_cast<float>(key_ptr[j * dim + d]);
         }
-        repre_ptr[d] = sum / block_size;
+        repre_ptr[d] = static_cast<scalar_t>(sum / block_size);
     }
 }
 
