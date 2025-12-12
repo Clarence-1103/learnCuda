@@ -1,7 +1,6 @@
 import torch
 import math
 from torch.utils.cpp_extension import load
-from hash_encoder import HashEncoder
 import time
 
 torch.set_grad_enabled(False)
@@ -9,7 +8,7 @@ torch.set_grad_enabled(False)
 # Load the CUDA kernel as a python module
 lib = load(
     name="kvcomp_utils",
-    sources=["kvcomp_utils.cu"],
+    sources=["kvcomp_interface.cu"],
     extra_cuda_cflags=[
         "-O3",
         "-U__CUDA_NO_HALF_OPERATORS__",
@@ -106,8 +105,8 @@ print("index_sorted: ", index_sorted)
 diff = (score.float() - score_gt.float()).abs()
 print("diff: ", diff.mean(), diff.max())
 
-total_seq_len = 10000
-batch_size = 4
+batch_size = 10
+total_seq_len = 3200 // 128 * batch_size
 topk = 10
 num_layers = 61
 warmup_iters = 10
